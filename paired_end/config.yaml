@@ -1,0 +1,12 @@
+library: libraryid
+
+indir: path/to/fastq/directory
+
+outdir: path/to/output/directory
+
+reference_genome: /path/to/reference/genome/build
+
+# FAstqs should be formatted {cellid}_1.fastq.gz and {cellid}_2.fastq.gz
+cells: 
+- cell1
+- cell2

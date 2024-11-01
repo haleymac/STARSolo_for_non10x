@@ -1,0 +1,15 @@
+library: RamDA 
+
+indir: /path/to/fastq/input/directory
+
+outdir: /path/to/starsolo/outdir
+
+reference_genome: /path/to/reference/genome
+
+#path to directory you're running the workflow in 
+running_path: /path/to/working/directory
+
+#Fastqs should have format {cellid}.fastq.gz
+cells:
+- cell1
+- cell2

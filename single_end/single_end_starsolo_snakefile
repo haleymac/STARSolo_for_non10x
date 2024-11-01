@@ -1,0 +1,153 @@
+
+
+import os 
+import sys
+sys.path.insert(0, '../')from starsolo_workflow_functions import *
+import pandas as pd
+
+
+configfile: 'config.yaml'
+
+
+CELLID = config['cells']
+barcodes = pd.read_csv('/projects/steiflab/research/hmacdonald/total_RNA/workflows/other_analysis/count_matrix/spliced_unspliced_counts_generation/STARsolo/bam_workflow/10_barcode_whitelist.txt', sep = '\t')
+barcodes = list(barcodes['barcode'])[:len(CELLID)]
+barcode_df = pd.DataFrame({'barcodes': barcodes, 'cells': CELLID})
+barcode_dict = barcode_df.set_index('cells')['barcodes'].to_dict()
+
+rule all:
+    input: 
+        expand(os.path.join(config['indir'], "trimmed", "{cellid}_trimmed.fastq.gz"), cellid = CELLID)
+        #os.path.join(config['outdir'], f"{config['library']}_cells_barcodes.csv"),
+        #f"{config['library']}.starsolod.Aligned.sortedByCoord.out.bam"
+        #os.path.join(config['outdir'], f"{config['library']}_adata.h5ad")
+
+
+#Optional fastp trimming step 
+rule trim:
+    input:
+        fq = os.path.join(config['indir'], "{cellid}.fastq.gz")
+    output: 
+        fq = os.path.join(config['indir'], "trimmed", "{cellid}_trimmed.fastq.gz"),
+        html = os.path.join(config['indir'], "fastp_output", "{cellid}_fastp.html"),
+        json = os.path.join(config['indir'], "fastp_output", "{cellid}_fastp.json")
+    shell: """
+        fastp -i {input.fq} -o {output.fq} -h {output.html} -j {output.json} 
+    """
+
+
+#Align fastq to reference genome 
+rule align:
+    input: 
+        fq = os.path.join(config['indir'], "trimmed", "{cellid}_trimmed.fastq.gz"),
+        ref = config['reference_genome']
+    output: "{cellid}.Aligned.sortedByCoord.out.bam"
+    shell: """
+        STAR --genomeDir {input.ref} \
+        --runThreadN 8 \
+        --readFilesIn {input.fq} \
+        --readFilesCommand zcat \
+        --outFileNamePrefix {wildcards.cellid}. \
+        --outSAMtype BAM SortedByCoordinate \
+        --outSAMunmapped Within 
+    """
+
+
+#Remove duplicates with same start/end coordinates 
+rule remove_duplicates:
+    input:
+        bam = "{cellid}.Aligned.sortedByCoord.out.bam",
+    output:
+        dup_bam = os.path.join("duplicate_removed", "{cellid}.nodups.bam"),
+        txt = os.path.join("mark_duplicates_output", "{cellid}.marked_dup_metrics.txt")
+    shell:'''
+    gatk MarkDuplicates \
+      -I {input.bam} \
+      -O {output.dup_bam} \
+      -M {output.txt} \
+      --REMOVE_DUPLICATES
+    '''
+
+ #convert to sam so we can add barcode tags 
+rule convert_sam: 
+    input: os.path.join("duplicate_removed", "{cellid}.nodups.bam")
+    output: "{cellid}.nodups.sam"
+    shell: """
+    samtools view -h  {input} > {output}
+    """
+
+#Add read group ids to keep track of which cells are from what library
+rule add_RGID:
+    input: "{cellid}.nodups.sam"
+    output: "{cellid}.nodups.rgid.sam"
+    shell:"""
+    gatk AddOrReplaceReadGroups I={input} O={output} RGID={wildcards.cellid} RGLB=Buettner2015 RGPL=SMARTer2015 RGPU=unit1 RGSM=20
+    """
+
+
+# To make our cells look like they were produced by 10x, we need to add barcode tags to the bam files 
+rule add_barcode_quality_tag_to_sam:
+    input: 
+        sam = "{cellid}.nodups.rgid.sam"
+    output: 
+        sam = "{cellid}.nodups.rgid.barcoded.sam",
+        barcode_file = temp(os.path.join(config['outdir'], "{cellid}_barcode.csv"))
+    params: 
+        cell ='{cellid}'
+    run:
+        barcode = barcode_dict[params.cell]
+        with open(output.barcode_file, 'w') as f:
+            f.write(f"{params.cell},{barcode}\n")
+        add_barcode_quality_tag_to_sam(input.sam, output.sam, barcode)
+
+#Output a list of the original cell ids and corresponding barcodes so we can keep track of which cell is which 
+rule output_barcodes:
+    input: 
+        barcode_files = expand(os.path.join(config['outdir'], "{cellid}_barcode.csv"), cellid = CELLID)
+    output:
+        csv = os.path.join(config['outdir'], f"{config['library']}_cells_barcodes.csv")
+    run:
+        with open(output.csv, 'w') as outfile:
+            outfile.write('cell_id,barcode\n')  
+            for file in input.barcode_files:
+                with open(file, 'r') as infile:
+                    for line in infile:
+                        outfile.write(line)
+
+# 10x produces one large bam file with all cells, so we need to merge our individual cell bams to make this look like a 10x library 
+rule merge_barcoded_bams:
+    input: 
+        expand("{cellid}.nodups.rgid.barcoded.sam", cellid = CELLID)
+    output: 
+        f"{config['library']}_merged_barcoded_cells.sam"
+    shell: """
+        samtools merge {output} *.nodups.mated.rgid.barcoded.sam
+    """
+
+# Finally we can run STARSolo and produce count matrices for spliced/unspliced counts for a non-10x library!
+rule run_starsolo:
+    input: 
+        sam = f"{config['library']}_merged_barcoded_cells.sam",
+        ref = config['reference_genome']
+    output:
+        bam = f"{config['library']}.starsolod.Aligned.sortedByCoord.out.bam",
+        direct = directory(f"{config['library']}.starsolod.Solo.out")
+    params: 
+        library = config['library']
+    shell:"""
+        STAR --genomeDir {input.ref} \
+        --runThreadN 8 \
+        --readFilesIn {input.sam} \
+        --readFilesType SAM SE \
+        --soloType Droplet \
+        --soloCBwhitelist None \
+        --soloInputSAMattrBarcodeSeq CR UR \
+        --soloInputSAMattrBarcodeQual CY UY \
+        --soloUMIdedup NoDedup \
+        --soloFeatures Gene Velocyto \
+        --outSAMtype BAM SortedByCoordinate \
+        --outFileNamePrefix {params.library}.starsolod. \
+        --limitBAMsortRAM 274587656537
+    """
+
+

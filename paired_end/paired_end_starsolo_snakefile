@@ -1,0 +1,139 @@
+import os 
+import sys
+sys.path.insert(0, '../')
+from starsolo_workflow_functions import *
+
+
+configfile: 'config.yaml'
+
+
+CELLID = config['cells']
+
+
+
+rule all:
+    input: f"{config['library']}.starsolod.Solo.out"
+
+# Align cells individually to reference genome 
+rule align:
+    input: 
+        fq1 = os.path.join(config['indir'], "{cellid}_1.fastq.gz"),
+        fq2 = os.path.join(config['indir'], "{cellid}_2.fastq.gz"),
+        ref = config['reference_genome']
+    output: "{cellid}.Aligned.sortedByCoord.out.bam"
+    shell: """
+        STAR --genomeDir {input.ref} \
+        --runThreadN 8 \
+        --readFilesIn {input.fq1} {input.fq2} \
+        --outFileNamePrefix {wildcards.cellid}. \
+        --outSAMunmapped Within \
+        --readFilesCommand zcat \
+        --outSAMtype BAM SortedByCoordinate 
+    """
+
+
+# Remove duplicates with same start/end coordinates - included for libraries with no UMIs for duplicate removal
+rule remove_duplicates:
+    input:
+        bam = "{cellid}.Aligned.sortedByCoord.out.bam",
+    output:
+        dup_bam = os.path.join("duplicate_removed", "{cellid}.nodups.bam"),
+        txt = os.path.join("mark_duplicates_output", "{cellid}.marked_dup_metrics.txt")
+    shell:'''
+    gatk MarkDuplicates \
+      -I {input.bam} \
+      -O {output.dup_bam} \
+      -M {output.txt} \
+      --REMOVE_DUPLICATES
+    '''
+
+
+#Add a read group ID so we can track which library a cell came from
+rule add_RGID:
+    input: os.path.join("duplicate_removed", "{cellid}.nodups.bam")
+    output: "{cellid}.nodups.rgid.sam"
+    shell:"""
+    gatk AddOrReplaceReadGroups I={input} O={output} RGID={wildcards.cellid} RGLB=Buettner2015 RGPL=SMARTer2015 RGPU=unit1 RGSM=20
+    """
+
+
+# To make our cells look like they were produced by 10x, we need to add barcode tags to the bam files 
+rule add_barcode_quality_tag_to_sam:
+    input: 
+        sam = "{cellid}.nodups.rgid.sam"
+    output: 
+        sam = "{cellid}.nodups.rgid.barcoded.sam",
+        barcode_file = temp(os.path.join(config['outdir'], "{cellid}_barcode.csv"))
+    params: 
+        cell ='{cellid}'
+    run:
+        new_barcode = ''.join(random.choice("ATGC") for _ in range(16))
+        with open(output.barcode_file, 'w') as f:
+            f.write(f"{params.cell},{new_barcode}\n")
+        add_barcode_quality_tag_to_sam(input.sam, output.sam, new_barcode)
+
+#Output a list of the original cell ids and corresponding barcodes so we can keep track of which cell is which 
+rule output_barcodes:
+    input: 
+        barcode_files = expand(os.path.join(config['outdir'], "{cellid}_barcode.csv"), cellid = CELLID)
+    output:
+        csv = os.path.join(config['outdir'], f"{config['library']}_cells_barcodes.csv")
+    run:
+        with open(output.csv, 'w') as outfile:
+            outfile.write('cell_id,barcode\n')  
+            for file in input.barcode_files:
+                with open(file, 'r') as infile:
+                    for line in infile:
+                        outfile.write(line)
+
+
+# 10x produces one large bam file with all cells, so we need to merge our individual cell bams to make this look like a 10x library 
+rule merge_barcoded_bams:
+    input: 
+        expand("{cellid}.nodups.rgid.barcoded.sam", cellid = CELLID)
+    output: 
+        f"{config['library']}_merged_barcoded_cells.sam"
+    shell: """
+        samtools merge {output} *.nodups.rgid.barcoded.sam
+    """
+
+#Starsolo does not accept files with non-primary or unampped reads, so we need to remove them, and also sort the bam file by read name
+rule samtools_filtering:
+    input:
+        sam = f"{config['library']}_merged_barcoded_cells.sam"
+    output:
+        sam = f"{config['library']}_merged_barcoded_cells.filtered.sorted.sam"
+
+    shell: """
+        samtools view -h -f 0x2 {input.sam} | \
+        samtools view -h -F 0x4 | \
+        samtools view -h -F 0x900 | \
+        samtools sort -n -o {output.sam}
+    """    
+
+
+# Finally we can run STARSolo and produce count matrices for spliced/unspliced counts for a non-10x library!
+rule run_starsolo:
+    input: 
+        sam = f"{config['library']}_merged_barcoded_cells.filtered.sorted.sam",
+        ref = config['reference_genome']
+    output:
+        bam = f"{config['library']}.starsolod.Aligned.sortedByCoord.out.bam",
+        direct = directory(f"{config['library']}.starsolod.Solo.out")
+    params: 
+        library = config['library']
+    shell:"""
+        STAR --genomeDir {input.ref} \
+        --runThreadN 8 \
+        --readFilesIn {input.sam} \
+        --readFilesType SAM PE \
+        --soloType Droplet \
+        --soloCBwhitelist None \
+        --soloInputSAMattrBarcodeSeq CR UR \
+        --soloInputSAMattrBarcodeQual CY UY \
+        --soloUMIdedup NoDedup \
+        --soloFeatures Gene Velocyto \
+        --outSAMtype BAM SortedByCoordinate \
+        --outFileNamePrefix {params.library}.starsolod. \
+        --limitBAMsortRAM 274587656537
+    """
