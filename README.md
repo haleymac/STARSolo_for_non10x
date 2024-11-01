@@ -3,7 +3,7 @@
 Working with scRNAseq libraries produced by varying library chemistries can be challenging! 
 Though STARSolo provides a way to obtain regular count matrics from SMARTSeq2 libraries, it currently does not support generating Spliced/Unspliced counts from any technologies other than 10x.
 
-We have created these Snakemake workflows to address these limitations, which take trimmed individual cell fastq files from technologies other than 10x and convert them into 10x-like files by adding unique barcode and UMI sequences to bam files after alignment, and subsequently merging the individual cell bams and using STARSolo to produce count matrics for all/spliced/unspliced reads. 
+We have created these Snakemake workflows to address these limitations, which take trimmed individual cell fastq files from technologies other than 10x and convert them into 10x-like files by adding unique barcode and UMI sequences to bam files after alignment, and subsequently merge the individual cell bams and use STARSolo to produce count matrics for all/spliced/unspliced reads. 
 
 Included here are workflows for libraries produced with either single end and paired end sequencing. 
 
